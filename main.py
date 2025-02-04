@@ -1,116 +1,163 @@
 from typing import Union
+# Import necessary modules and classes
+import httpx
+import requests
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi import Request
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine, Column, Integer, String
+import sqlalchemy
+from sqlalchemy.orm import sessionmaker, Session
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import os
+import hmac
+import hashlib
 
-from fastapi import FastAPI
+
+load_dotenv()
+
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 
 app = FastAPI()
+# Database setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*","http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+DATABASE_URL = "sqlite:///./test.db"
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = sqlalchemy.orm.declarative_base()
+
+class Payment(Base):
+    __tablename__ = "payments"
+
+    id = Column(String, primary_key=True, index=True)
+    amount = Column(Integer)
+    currency = Column(String)
+    status = Column(String)
+    username = Column(String)
+
+class PaymentVerify(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+# Create a separate Pydantic model for input validation
+class PaymentCreate(BaseModel):
+    amount: int
+    currency: str
+    username: str
+    status: str
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 @app.get("/")
 async def read_root():
     return {"Hello": "World"}
 
+@app.post("/payment/")
+def create_purchase(payment: PaymentCreate, db: Session = Depends(get_db)):
+    try:
+        response = requests.post(
+            "https://api.razorpay.com/v1/orders",
+            json={
+                "amount": payment.amount,
+                "currency": payment.currency,
+            },
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
+        )
+        response.raise_for_status()
+        order_data = response.json()
 
-# from fastapi import FastAPI, HTTPException
-# from app.utils import create_plan, create_subscription, cancel_subscription, get_subscription, get_all_plans ,razorpay_client
-# from pydantic import BaseModel
+        db_payment = Payment(
+            id=order_data['id'],
+            amount=payment.amount,
+            currency=payment.currency,
+            status=payment.status,
+            username=payment.username
+        )
+        db.add(db_payment)
+        db.commit()
+        db.refresh(db_payment)
+        return db_payment
+    except requests.HTTPError as e:
+        print(e)
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
-# app = FastAPI()
+@app.post("/payment/verify")
+async def verify_payment(paymentVerify: PaymentVerify, db: Session = Depends(get_db)):
+    try:
+        message = f"{paymentVerify.razorpay_order_id}|{paymentVerify.razorpay_payment_id}".encode('utf-8')
+        generated_signature = hmac.new(
+            RAZORPAY_KEY_SECRET.encode('utf-8'),
+            msg=message,
+            digestmod=hashlib.sha256
+        ).hexdigest()
 
-# # In-memory store for subscriptions (Replace with DB for production)
-# subscriptions = {}
+        if not hmac.compare_digest(generated_signature, paymentVerify.razorpay_signature):
+            raise HTTPException(status_code=400, detail="Invalid signature")
 
-# # Pydantic model for plan creation input validation
-# class PlanCreateRequest(BaseModel):
-#     name: str
-#     description: str
-#     amount: int  # Amount in INR
-#     period: str  # 'daily', 'weekly', 'monthly', 'yearly'
-#     interval: int  # Interval for the period
-
-# @app.post("/create-plan/")
-# def create_new_plan(plan_request: PlanCreateRequest):
-#     try:
-#         plan = create_plan(
-#             name=plan_request.name,
-#             description=plan_request.description,
-#             amount=plan_request.amount,
-#             period=plan_request.period,
-#             interval=plan_request.interval
-#         )
-#         return {"plan": plan}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-
-# @app.post("/subscribe/")
-# def subscribe(plan_id: str, customer_id: str):
-#     try:
-#         subscription = create_subscription(plan_id, customer_id)
-#         subscriptions[customer_id] = subscription
-#         return {"subscription": subscription}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-
-# @app.post("/cancel-subscription/")
-# def cancel_existing_subscription(customer_id: str):
-#     try:
-#         subscription = subscriptions.get(customer_id)
-#         if not subscription:
-#             raise HTTPException(status_code=404, detail="Subscription not found")
-#         cancel_subscription(subscription['id'])
-#         return {"message": "Subscription cancelled successfully"}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-    
-# @app.get("/customer/{customer_id}/active-plan")
-# def get_active_plan(customer_id: str):
-#     try:
-#         # Fetch all subscriptions
-#         subscriptions = razorpay_client.subscription.all()
+        payment = db.query(Payment).filter(Payment.id == paymentVerify.razorpay_order_id).first()
         
-#         if not subscriptions['items']:
-#             raise HTTPException(status_code=404, detail="No subscriptions found.")
-        
-#         # Log all subscriptions to see their details
-#         print("Fetched Subscriptions:", subscriptions['items'])
-        
-#         # Loop through subscriptions and find the active one for the customer_id
-#         for subscription in subscriptions['items']:
-#             print("Checking subscription:", subscription)  # Log each subscription
+        if not payment:
+            raise HTTPException(status_code=404, detail="Payment not found")
 
-#             # Check if the subscription belongs to the customer and is active
-#             if subscription['customer_id'] == customer_id and subscription['status'] == 'active':
-#                 return {
-#                     "subscription_id": subscription['id'],
-#                     "plan_id": subscription['plan_id'],
-#                     "start_date": subscription['start'],
-#                     "end_date": subscription['end'],
-#                     "status": subscription['status'],
-#                     "amount": subscription['amount']
-#                 }
-        
-#         raise HTTPException(status_code=404, detail="No active subscription found for this customer.")
-    
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
+        payment.status = "paid"
+        db.commit()
+        db.refresh(payment)
 
-# # Route to list all available plans
-# @app.get("/plans/")
-# def list_all_plans():
-#     try:
-#         plans = get_all_plans()
-#         return {"plans": plans}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
+        return {
+            "status": "success",
+            "payment_id": payment.id,
+            "amount": payment.amount,
+            "currency": payment.currency
+        }
 
-# # New route to get subscription details by subscription ID
-# @app.get("/subscription/{subscription_id}")
-# def get_subscription_details(subscription_id: str):
-#     try:
-#         subscription = get_subscription(subscription_id)
-#         return {"subscription": subscription}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        db.rollback()
+        print(f"Error verifying payment: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error during verification")
 
-# @app.get("/")
-# def read_root():
-#     return {"message": "Welcome to FastAPI Razorpay Subscription Service"}
+@app.post("/payment/failure/{order_id}")
+async def payment_failure(
+    db: Session = Depends(get_db),
+    order_id: str = None
+):
+    try:
+        print(order_id)
+        payment = db.query(Payment).filter(Payment.id == order_id).first()
+        if payment:
+            payment.status = "failed"
+            db.commit()
+            db.refresh(payment)
+
+            return {
+                "message":"Payment failed",
+                "payment_id": payment.id,
+                "amount": payment.amount,
+            }
+        else:
+            raise HTTPException(status_code=404, detail = "No payments found")
+    except Exception as e:
+        db.rollback()
+        print(f"Error verifying payment: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error during verification")
